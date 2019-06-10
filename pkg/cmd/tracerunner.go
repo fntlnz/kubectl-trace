@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"github.com/iovisor/kubectl-trace/pkg/flamegraph"
 	"io"
 	"io/ioutil"
 	"os"
@@ -17,11 +19,15 @@ import (
 )
 
 type TraceRunnerOptions struct {
-	podUID             string
-	containerName      string
-	inPod              bool
-	programPath        string
-	bpftraceBinaryPath string
+	podUID                  string
+	containerName           string
+	inPod                   bool
+	programPath             string
+	bpftraceBinaryPath      string
+	flameGraphBinaryPath    string
+	stackCollapseBinaryPath string
+	flameGraph              bool
+	flameGraphOutputPath    string
 }
 
 func NewTraceRunnerOptions() *TraceRunnerOptions {
@@ -50,7 +56,11 @@ func NewTraceRunnerCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&o.podUID, "poduid", "p", o.podUID, "Specify the pod UID")
 	cmd.Flags().StringVarP(&o.programPath, "program", "f", "program.bt", "Specify the bpftrace program path")
 	cmd.Flags().StringVarP(&o.bpftraceBinaryPath, "bpftracebinary", "b", "/bin/bpftrace", "Specify the bpftrace binary path")
+	cmd.Flags().StringVar(&o.flameGraphBinaryPath, "flamegraphbinary", "/bin/flamegraph", "Specify the flamegraph generator binary path")
+	cmd.Flags().StringVar(&o.stackCollapseBinaryPath, "stackcollapsebinary", "/bin/stackcollapse-bpftrace", "Specify the stackcollapse-bpftrace binary path (used for Flame Graphs)")
 	cmd.Flags().BoolVar(&o.inPod, "inpod", false, "Whether or not run this bpftrace in a pod's container process namespace")
+	cmd.Flags().BoolVar(&o.flameGraph, "flamegraph", false, "When true, generate and save a Flame Graph (only works with stack, kstack and ustack)")
+	cmd.Flags().StringVar(&o.flameGraphOutputPath, "flamegraph-output-path", "/tmp/flamegraph.svg", "Where to save the generated flamegraph")
 	return cmd
 }
 
@@ -117,10 +127,53 @@ func (o *TraceRunnerOptions) Run() error {
 	}()
 
 	c := exec.CommandContext(ctx, o.bpftraceBinaryPath, programPath)
-	c.Stdout = os.Stdout
+
+	var stackBuf io.ReadWriter
+	stackBuf = os.Stdout
+
+	if o.flameGraph {
+		stackBuf = new(bytes.Buffer)
+	}
+
+	c.Stdout = stackBuf
 	c.Stdin = os.Stdin
 	c.Stderr = os.Stderr
-	return c.Run()
+
+	if err := c.Run(); err != nil {
+		return err
+	}
+	if o.flameGraph {
+		if err := generateFlameGraph(ctx,
+			stackBuf,
+			o.stackCollapseBinaryPath,
+			o.flameGraphBinaryPath,
+			o.flameGraphOutputPath,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generateFlameGraph(ctx context.Context,
+	stackBuf io.ReadWriter,
+	stackCollapseBinaryPath string,
+	flameGraphBinaryPath string,
+	flameGraphOutputPath string) error {
+	fg := flamegraph.New(stackCollapseBinaryPath, flameGraphBinaryPath)
+
+	fgbuf, err := fg.Generate(ctx, stackBuf)
+
+	if err != nil {
+		return err
+	}
+
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(fgbuf)
+	if err := ioutil.WriteFile("/dev/stdout", buf.Bytes(), 0644); err != nil {
+		return err
+	}
+	return nil
 }
 
 func findPidByPodContainer(podUID, containerName string) (*string, error) {

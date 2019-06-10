@@ -37,6 +37,7 @@ type TraceJob struct {
 	FetchHeaders     bool
 	StartTime        metav1.Time
 	Status           TraceJobStatus
+	FlameGraph       bool
 }
 
 // WithOutStream setup a file stream to output trace job operation information
@@ -186,6 +187,10 @@ func (t *TraceJobClient) CreateJob(nj TraceJob) (*batchv1.Job, error) {
 	bpfTraceCmd := []string{
 		"/bin/trace-runner",
 		"--program=/programs/program.bt",
+	}
+
+	if nj.FlameGraph {
+		bpfTraceCmd = append(bpfTraceCmd, "--flamegraph")
 	}
 
 	if nj.IsPod {

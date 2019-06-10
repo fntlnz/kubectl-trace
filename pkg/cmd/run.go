@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/iovisor/kubectl-trace/pkg/cp"
 	"io/ioutil"
 
 	"github.com/iovisor/kubectl-trace/pkg/attacher"
@@ -73,6 +74,7 @@ type RunOptions struct {
 	imageName      string
 	initImageName  string
 	fetchHeaders   bool
+	flameGraph     bool
 
 	resourceArg string
 	attach      bool
@@ -127,6 +129,7 @@ func NewRunCommand(factory factory.Factory, streams genericclioptions.IOStreams)
 	cmd.Flags().StringVar(&o.imageName, "imagename", o.imageName, "Custom image for the tracerunner")
 	cmd.Flags().StringVar(&o.initImageName, "init-imagename", o.initImageName, "Custom image for the init container responsible to fetch and prepare linux headers")
 	cmd.Flags().BoolVar(&o.fetchHeaders, "fetch-headers", o.fetchHeaders, "Whether to fetch linux headers or not")
+	cmd.Flags().BoolVar(&o.flameGraph, "flamegraph", o.flameGraph, "Generate and save a Flame Graph (only works with stack, kstack and ustack), must be used with attach.")
 
 	return cmd
 }
@@ -158,6 +161,10 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 	}
 	if (cmd.Flag("eval").Changed && len(o.eval) == 0) || (cmd.Flag("filename").Changed && len(o.program) == 0) {
 		return fmt.Errorf(bpftraceEmptyErrString)
+	}
+
+	if o.flameGraph && !o.attach {
+		return fmt.Errorf("a FlameGraph can be generated only in attach mode")
 	}
 
 	return nil
@@ -289,19 +296,19 @@ func (o *RunOptions) Run() error {
 	}
 
 	tj := tracejob.TraceJob{
-		Name:           fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
-		Namespace:      o.namespace,
-		ServiceAccount: o.serviceAccount,
-		ID:             juid,
-		Hostname:       o.nodeName,
-		Program:        o.program,
-		PodUID:         o.podUID,
-		ContainerName:  o.container,
-		IsPod:          o.isPod,
-		// todo(dalehamel) > following fields to be used for #48
+		Name:             fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
+		Namespace:        o.namespace,
+		ServiceAccount:   o.serviceAccount,
+		ID:               juid,
+		Hostname:         o.nodeName,
+		Program:          o.program,
+		PodUID:           o.podUID,
+		ContainerName:    o.container,
+		IsPod:            o.isPod,
 		ImageNameTag:     o.imageName,
 		InitImageNameTag: o.initImageName,
 		FetchHeaders:     o.fetchHeaders,
+		FlameGraph:       o.flameGraph,
 	}
 
 	job, err := tc.CreateJob(tj)
@@ -317,6 +324,22 @@ func (o *RunOptions) Run() error {
 		a := attacher.NewAttacher(coreClient, o.clientConfig, o.IOStreams)
 		a.WithContext(ctx)
 		a.AttachJob(tj.ID, job.Namespace)
+	}
+
+	if o.flameGraph {
+		src := cp.FileSpec{
+			PodNamespace: job.Namespace,
+			PodName:      "",
+			File:         "/tmp/flamegraph.svg",
+		}
+		dest := cp.FileSpec{
+			PodNamespace: job.Namespace,
+			PodName:      "",
+			File:         "/tmp/copiedflamegraph.svg",
+		}
+		if err := cp.CopyFromPod(src, dest); err != nil {
+			return err
+		}
 	}
 
 	return nil

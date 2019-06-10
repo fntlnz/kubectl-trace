@@ -22,6 +22,7 @@ IMAGE_INITCONTAINER_COMMIT := $(IMAGE_NAME_INIT):$(GIT_COMMIT)
 IMAGE_INITCONTAINER_LATEST := $(IMAGE_NAME_INIT):latest
 
 BPFTRACESHA ?= 81b099f094d2e6092cfe1317cbaaba0c1bbb614f
+FLAMEGRAPHSHA ?= 1b1c6deede9c33c5134c920bdb7a44cc5528e9a7
 BCCVERSION ?= 0.8.0
 IMAGE_BPFTRACE_BASE := $(IMAGE_NAME_BASE):$(BPFTRACESHA)
 
@@ -51,6 +52,7 @@ image/build:
 	$(DOCKER) build \
 		--build-arg bpftracesha=$(BPFTRACESHA) \
 		--build-arg imagenamebase=$(IMAGE_NAME_BASE) \
+		--build-arg flamegraphsha=$(FLAMEGRAPHSHA) \
 		$(IMAGE_BUILD_FLAGS) \
 		-t $(IMAGE_TRACERUNNER_BRANCH) \
 		-f Dockerfile.tracerunner .
