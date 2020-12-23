@@ -31,6 +31,8 @@ type TraceJob struct {
 	ServiceAccount      string
 	Hostname            string
 	Program             string
+	ProgramArgs         []string
+	IsBcc               bool
 	PodUID              string
 	ContainerName       string
 	IsPod               bool
@@ -194,13 +196,25 @@ func (t *TraceJobClient) CreateJob(nj TraceJob) (*batchv1.Job, error) {
 		"INT",
 		strconv.FormatInt(nj.Deadline, 10),
 		"/bin/trace-runner",
-		"--program=/programs/program.bt",
+	}
+
+	if !nj.IsBcc {
+		bpfTraceCmd = append(bpfTraceCmd, "--program=/programs/program.bt")
+	} else {
+		bpfTraceCmd = append(bpfTraceCmd, "--bcctool")
+		bpfTraceCmd = append(bpfTraceCmd, nj.Program)
 	}
 
 	if nj.IsPod {
 		bpfTraceCmd = append(bpfTraceCmd, "--inpod")
 		bpfTraceCmd = append(bpfTraceCmd, "--container="+nj.ContainerName)
 		bpfTraceCmd = append(bpfTraceCmd, "--poduid="+nj.PodUID)
+	}
+
+	// bcc tool args go last
+	if nj.IsBcc {
+		bpfTraceCmd = append(bpfTraceCmd, "--")
+		bpfTraceCmd = append(bpfTraceCmd, nj.ProgramArgs...)
 	}
 
 	commonMeta := metav1.ObjectMeta{
@@ -216,11 +230,18 @@ func (t *TraceJobClient) CreateJob(nj TraceJob) (*batchv1.Job, error) {
 		},
 	}
 
+	var programConfig map[string]string
+	if !nj.IsBcc {
+		programConfig = map[string]string{
+			"program.bt": nj.Program,
+		}
+	} else {
+		programConfig = map[string]string{}
+	}
+
 	cm := &apiv1.ConfigMap{
 		ObjectMeta: commonMeta,
-		Data: map[string]string{
-			"program.bt": nj.Program,
-		},
+		Data: programConfig,
 	}
 
 	job := &batchv1.Job{

@@ -61,10 +61,10 @@ var (
 	runCommand                    = "run"
 	usageString                   = "(POD | TYPE/NAME)"
 	requiredArgErrString          = fmt.Sprintf("%s is a required argument for the %s command", usageString, runCommand)
-	containerAsArgOrFlagErrString = "specify container inline as argument or via its flag"
-	bpftraceMissingErrString      = "the bpftrace program is mandatory"
+	bpfMissingErrString           = "you must specify either a bpftrace or a bcc program"
 	bpftraceDoubleErrString       = "specify the bpftrace program either via an external file or via a literal string, not both"
 	bpftraceEmptyErrString        = "the bpftrace programm cannot be empty"
+	bpftraceBccErrString          = "cannot specify both a bpftrace and bcc program"
 )
 
 // RunOptions ...
@@ -76,14 +76,21 @@ type RunOptions struct {
 
 	// Flags local to this command
 	container           string
-	eval                string
-	program             string
 	serviceAccount      string
 	imageName           string
 	initImageName       string
 	fetchHeaders        bool
 	deadline            int64
 	deadlineGracePeriod int64
+
+	// bpftrace-specific flags
+	bpftraceEval        string
+	bpftraceProgram     string
+
+	// bcc-specific flags
+	bccTool string
+	bccArgs []string
+	isBcc   bool
 
 	resourceArg string
 	attach      bool
@@ -134,8 +141,9 @@ func NewRunCommand(factory cmdutil.Factory, streams genericclioptions.IOStreams)
 
 	cmd.Flags().StringVarP(&o.container, "container", "c", o.container, "Specify the container")
 	cmd.Flags().BoolVarP(&o.attach, "attach", "a", o.attach, "Whether or not to attach to the trace program once it is created")
-	cmd.Flags().StringVarP(&o.eval, "eval", "e", o.eval, "Literal string to be evaluated as a bpftrace program")
-	cmd.Flags().StringVarP(&o.program, "filename", "f", o.program, "File containing a bpftrace program")
+	cmd.Flags().StringVarP(&o.bpftraceEval, "eval", "e", o.bpftraceEval, "Literal string to be evaluated as a bpftrace program")
+	cmd.Flags().StringVarP(&o.bccTool, "bcc", "b", o.bccTool, "Name of tool that ships with BCC toolkit - e.g. 'memleak'")
+	cmd.Flags().StringVarP(&o.bpftraceProgram, "filename", "f", o.bpftraceProgram, "File containing a bpftrace program")
 	cmd.Flags().StringVar(&o.serviceAccount, "serviceaccount", o.serviceAccount, "Service account to use to set in the pod spec of the kubectl-trace job")
 	cmd.Flags().StringVar(&o.imageName, "imagename", o.imageName, "Custom image for the tracerunner")
 	cmd.Flags().StringVar(&o.initImageName, "init-imagename", o.initImageName, "Custom image for the init container responsible to fetch and prepare linux headers")
@@ -148,31 +156,30 @@ func NewRunCommand(factory cmdutil.Factory, streams genericclioptions.IOStreams)
 
 // Validate validates the arguments and flags populating RunOptions accordingly.
 func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
-	containerFlagDefined := cmd.Flag("container").Changed
-	switch len(args) {
-	case 1:
+	bccFlagDefined := cmd.Flag("bcc").Changed
+
+	numArgs := len(args)
+
+	if numArgs == 1 {
 		o.resourceArg = args[0]
-		break
-	// 2nd argument interpreted as container when provided
-	case 2:
+	} else if numArgs >= 2 && bccFlagDefined {
 		o.resourceArg = args[0]
-		o.container = args[1]
-		if containerFlagDefined {
-			return fmt.Errorf(containerAsArgOrFlagErrString)
-		}
-		break
-	default:
+		o.bccArgs = args[1:]
+	} else {
 		return fmt.Errorf(requiredArgErrString)
 	}
 
-	if !cmd.Flag("eval").Changed && !cmd.Flag("filename").Changed {
-		return fmt.Errorf(bpftraceMissingErrString)
+	if !cmd.Flag("eval").Changed && !cmd.Flag("filename").Changed && !cmd.Flag("bcc").Changed {
+		return fmt.Errorf(bpfMissingErrString)
 	}
-	if cmd.Flag("eval").Changed == cmd.Flag("filename").Changed {
+	if cmd.Flag("eval").Changed && cmd.Flag("filename").Changed {
 		return fmt.Errorf(bpftraceDoubleErrString)
 	}
-	if (cmd.Flag("eval").Changed && len(o.eval) == 0) || (cmd.Flag("filename").Changed && len(o.program) == 0) {
+	if (cmd.Flag("eval").Changed && len(o.bpftraceEval) == 0) || (cmd.Flag("filename").Changed && len(o.bpftraceProgram) == 0) {
 		return fmt.Errorf(bpftraceEmptyErrString)
+	}
+	if (cmd.Flag("eval").Changed || cmd.Flag("filename").Changed) && cmd.Flag("bcc").Changed {
+		return fmt.Errorf(bpftraceBccErrString)
 	}
 
 	return nil
@@ -181,14 +188,18 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 // Complete completes the setup of the command.
 func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args []string) error {
 	// Prepare program
-	if len(o.program) > 0 {
-		b, err := ioutil.ReadFile(o.program)
+	if len(o.bpftraceProgram) > 0 {
+		b, err := ioutil.ReadFile(o.bpftraceProgram)
 		if err != nil {
 			return fmt.Errorf("error opening program file")
 		}
-		o.program = string(b)
-	} else {
-		o.program = o.eval
+		o.bpftraceProgram = string(b)
+		o.isBcc = false
+	} else if len(o.bpftraceEval) > 0 {
+		o.bpftraceProgram = o.bpftraceEval
+		o.isBcc = false
+	} else if len(o.bccTool) > 0 {
+		o.isBcc = true
 	}
 
 	// Prepare namespace
@@ -303,21 +314,45 @@ func (o *RunOptions) Run() error {
 		ConfigClient: coreClient.ConfigMaps(o.namespace),
 	}
 
-	tj := tracejob.TraceJob{
-		Name:                fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
-		Namespace:           o.namespace,
-		ServiceAccount:      o.serviceAccount,
-		ID:                  juid,
-		Hostname:            o.nodeName,
-		Program:             o.program,
-		PodUID:              o.podUID,
-		ContainerName:       o.container,
-		IsPod:               o.isPod,
-		ImageNameTag:        o.imageName,
-		InitImageNameTag:    o.initImageName,
-		FetchHeaders:        o.fetchHeaders,
-		Deadline:            o.deadline,
-		DeadlineGracePeriod: o.deadlineGracePeriod,
+	var tj tracejob.TraceJob
+	if !o.isBcc {
+		tj = tracejob.TraceJob{
+			Name:                fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
+			Namespace:           o.namespace,
+			ServiceAccount:      o.serviceAccount,
+			ID:                  juid,
+			Hostname:            o.nodeName,
+			Program:             o.bpftraceProgram,
+			ProgramArgs:         []string{},
+			IsBcc:               o.isBcc,
+			PodUID:              o.podUID,
+			ContainerName:       o.container,
+			IsPod:               o.isPod,
+			ImageNameTag:        o.imageName,
+			InitImageNameTag:    o.initImageName,
+			FetchHeaders:        o.fetchHeaders,
+			Deadline:            o.deadline,
+			DeadlineGracePeriod: o.deadlineGracePeriod,
+		}
+	} else {
+		tj = tracejob.TraceJob{
+			Name:                fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
+			Namespace:           o.namespace,
+			ServiceAccount:      o.serviceAccount,
+			ID:                  juid,
+			Hostname:            o.nodeName,
+			Program:             o.bccTool,
+			ProgramArgs:         o.bccArgs,
+			IsBcc:               o.isBcc,
+			PodUID:              o.podUID,
+			ContainerName:       o.container,
+			IsPod:               o.isPod,
+			ImageNameTag:        o.imageName,
+			InitImageNameTag:    o.initImageName,
+			FetchHeaders:        o.fetchHeaders,
+			Deadline:            o.deadline,
+			DeadlineGracePeriod: o.deadlineGracePeriod,
+		}
 	}
 
 	job, err := tc.CreateJob(tj)

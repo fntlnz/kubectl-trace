@@ -22,6 +22,10 @@ type TraceRunnerOptions struct {
 	inPod              bool
 	programPath        string
 	bpftraceBinaryPath string
+	bccTool            string
+	bccArgs            []string
+	bccToolPath        string
+	isBcc              bool
 }
 
 func NewTraceRunnerOptions() *TraceRunnerOptions {
@@ -50,6 +54,8 @@ func NewTraceRunnerCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&o.podUID, "poduid", "p", o.podUID, "Specify the pod UID")
 	cmd.Flags().StringVarP(&o.programPath, "program", "f", "program.bt", "Specify the bpftrace program path")
 	cmd.Flags().StringVarP(&o.bpftraceBinaryPath, "bpftracebinary", "b", "/bin/bpftrace", "Specify the bpftrace binary path")
+	cmd.Flags().StringVarP(&o.bccTool, "bcctool", "t", o.bccTool, "Specify the bcc tool")
+	cmd.Flags().StringVarP(&o.bccToolPath, "bcctoolpath", "q", "/usr/sbin", "Specify the directory bcc tools are installed in")
 	cmd.Flags().BoolVar(&o.inPod, "inpod", false, "Whether or not run this bpftrace in a pod's container process namespace")
 	return cmd
 }
@@ -59,12 +65,32 @@ func (o *TraceRunnerOptions) Validate(cmd *cobra.Command, args []string) error {
 	if o.inPod == true && (len(o.containerName) == 0 || len(o.podUID) == 0) {
 		return fmt.Errorf("poduid and container must be specified when inpod=true")
 	}
+
+	if cmd.Flag("program").Changed && cmd.Flag("bcctool").Changed {
+		return fmt.Errorf("cannot specify both bpftrace and bcc program")
+	}
+
+	if cmd.Flag("bcctool").Changed {
+		o.isBcc = true
+		// The image installs BCC through the Ubuntu package which suffixes all the tools with -bpfcc,
+		// e.g. memleak becomes memleak-bpfcc
+		bpfccSuffix := "-bpfcc"
+		if !strings.HasSuffix(o.bccTool, bpfccSuffix) {
+			o.bccTool += bpfccSuffix
+		}
+
+		o.bccArgs = args
+	}
 	return nil
 }
 
 // Complete completes the setup of the command.
 func (o *TraceRunnerOptions) Complete(cmd *cobra.Command, args []string) error {
 	return nil
+}
+
+func substituteVariables(s string, pid string) (string) {
+	return strings.Replace(s, "$container_pid", pid, -1)
 }
 
 func (o *TraceRunnerOptions) Run() error {
@@ -80,14 +106,21 @@ func (o *TraceRunnerOptions) Run() error {
 		if len(*pid) == 0 {
 			return fmt.Errorf("invalid pid found")
 		}
-		f, err := ioutil.ReadFile(programPath)
-		if err != nil {
-			return err
-		}
-		programPath = path.Join(os.TempDir(), "program-container.bt")
-		r := strings.Replace(string(f), "$container_pid", *pid, -1)
-		if err := ioutil.WriteFile(programPath, []byte(r), 0755); err != nil {
-			return err
+
+		if !o.isBcc {
+			f, err := ioutil.ReadFile(programPath)
+			if err != nil {
+				return err
+			}
+			programPath = path.Join(os.TempDir(), "program-container.bt")
+			r := substituteVariables(string(f), *pid)
+			if err := ioutil.WriteFile(programPath, []byte(r), 0755); err != nil {
+				return err
+			}
+		} else {
+			for i := range o.bccArgs {
+				o.bccArgs[i] = substituteVariables(o.bccArgs[i], *pid)
+			}
 		}
 	}
 
@@ -116,7 +149,18 @@ func (o *TraceRunnerOptions) Run() error {
 		}
 	}()
 
-	c := exec.CommandContext(ctx, o.bpftraceBinaryPath, programPath)
+	var program string
+	var args []string
+
+	if !o.isBcc {
+		program = o.bpftraceBinaryPath
+		args = []string{programPath}
+	} else {
+		program = o.bccToolPath + "/" + o.bccTool
+		args = o.bccArgs
+	}
+
+	c := exec.CommandContext(ctx, program, args...)
 	c.Stdout = os.Stdout
 	c.Stdin = os.Stdin
 	c.Stderr = os.Stderr
