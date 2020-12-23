@@ -22,7 +22,7 @@ import (
 
 var (
 	// ImageName represents the default tracerunner image
-	ImageName = "quay.io/iovisor/kubectl-trace-bpftrace"
+	ImageName = "quay.io/iovisor/kubectl-trace-runner"
 	// ImageTag represents the tag to fetch for ImageName
 	ImageTag = "latest"
 	// InitImageName represents the default init container image
@@ -65,6 +65,11 @@ var (
 	bpftraceMissingErrString      = "the bpftrace program is mandatory"
 	bpftraceDoubleErrString       = "specify the bpftrace program either via an external file or via a literal string, not both"
 	bpftraceEmptyErrString        = "the bpftrace programm cannot be empty"
+
+	tracerNotFound                   = "unknown tracer %s"
+	tracerNeededForSelectorErrString = "tracer must be specified when specifying selector"
+	containerAsSelectorErrString     = "container must be filtered in selector when specifying tracer"
+	resourceAsSelectorErrString      = "node/pod must be filtered in selector when specifying tracer"
 )
 
 // RunOptions ...
@@ -75,9 +80,18 @@ type RunOptions struct {
 	explicitNamespace bool
 
 	// Flags local to this command
-	container           string
-	eval                string
-	program             string
+	eval      string
+	filename  string
+	container string
+
+	// Flags for generic interface
+	// See TraceRunnerOptions for definitions.
+	tracer         string
+	selector       string
+	program        string
+	tracerDefined  bool
+	parsedSelector *tracejob.Selector
+
 	serviceAccount      string
 	imageName           string
 	initImageName       string
@@ -87,9 +101,6 @@ type RunOptions struct {
 
 	resourceArg string
 	attach      bool
-	isPod       bool
-	podUID      string
-	nodeName    string
 
 	clientConfig *rest.Config
 }
@@ -132,10 +143,18 @@ func NewRunCommand(factory cmdutil.Factory, streams genericclioptions.IOStreams)
 		},
 	}
 
-	cmd.Flags().StringVarP(&o.container, "container", "c", o.container, "Specify the container")
+	// flags for existing usage
+	cmd.Flags().StringVarP(&o.container, "container", "c", o.container, "DEPRECATED: Specify the container")
+	cmd.Flags().StringVarP(&o.eval, "eval", "e", o.eval, "DEPRECATED: Literal string to be evaluated as a bpftrace program")
+	cmd.Flags().StringVarP(&o.filename, "filename", "f", o.filename, "File containing a bpftrace program")
+
+	// flags for new generic interface
+	cmd.Flags().StringVar(&o.tracer, "tracer", "bpftrace", "Tracing system to use")
+	cmd.Flags().StringVar(&o.selector, "selector", "", "Selector (label query) to filter on")
+	cmd.Flags().StringVar(&o.program, "program", o.program, "Program to execute")
+
+	// global flags
 	cmd.Flags().BoolVarP(&o.attach, "attach", "a", o.attach, "Whether or not to attach to the trace program once it is created")
-	cmd.Flags().StringVarP(&o.eval, "eval", "e", o.eval, "Literal string to be evaluated as a bpftrace program")
-	cmd.Flags().StringVarP(&o.program, "filename", "f", o.program, "File containing a bpftrace program")
 	cmd.Flags().StringVar(&o.serviceAccount, "serviceaccount", o.serviceAccount, "Service account to use to set in the pod spec of the kubectl-trace job")
 	cmd.Flags().StringVar(&o.imageName, "imagename", o.imageName, "Custom image for the tracerunner")
 	cmd.Flags().StringVar(&o.initImageName, "init-imagename", o.initImageName, "Custom image for the init container responsible to fetch and prepare linux headers")
@@ -148,30 +167,70 @@ func NewRunCommand(factory cmdutil.Factory, streams genericclioptions.IOStreams)
 
 // Validate validates the arguments and flags populating RunOptions accordingly.
 func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
-	containerFlagDefined := cmd.Flag("container").Changed
-	switch len(args) {
-	case 1:
-		o.resourceArg = args[0]
-		break
-	// 2nd argument interpreted as container when provided
-	case 2:
-		o.resourceArg = args[0]
-		o.container = args[1]
-		if containerFlagDefined {
-			return fmt.Errorf(containerAsArgOrFlagErrString)
-		}
-		break
-	default:
-		return fmt.Errorf(requiredArgErrString)
+	// Selector can only be used in conjunction with tracer.
+	o.tracerDefined = cmd.Flag("tracer").Changed
+	if !o.tracerDefined && cmd.Flag("selector").Changed {
+		return fmt.Errorf(tracerNeededForSelectorErrString)
 	}
 
-	if !cmd.Flag("eval").Changed && !cmd.Flag("filename").Changed {
+	switch o.tracer {
+	case bpftrace, bcc:
+	default:
+		return fmt.Errorf(tracerNotFound, o.tracer)
+	}
+
+	parsed, err := tracejob.NewSelector(o.selector)
+	if err != nil {
+		return fmt.Errorf(err.Error())
+	}
+	o.parsedSelector = parsed
+
+	// All filtering must be via selector if tracer is specified.
+	containerFlagDefined := cmd.Flag("container").Changed
+	if o.tracerDefined && containerFlagDefined {
+		return fmt.Errorf(containerAsSelectorErrString)
+	}
+	if o.tracerDefined && len(args) > 0 {
+		return fmt.Errorf(resourceAsSelectorErrString)
+	}
+
+	if !o.tracerDefined {
+		switch len(args) {
+		case 1:
+			o.resourceArg = args[0]
+			break
+		// 2nd argument interpreted as container when provided
+		case 2:
+			o.resourceArg = args[0]
+			o.container = args[1]
+			if containerFlagDefined {
+				return fmt.Errorf(containerAsArgOrFlagErrString)
+			}
+			break
+		default:
+			return fmt.Errorf(requiredArgErrString)
+		}
+	} else {
+		// Using tracer so pull resources from selector.
+		if node, ok := o.parsedSelector.Node(); ok {
+			o.resourceArg = "node/" + node
+		}
+		if pod, ok := o.parsedSelector.Pod(); ok {
+			o.resourceArg = "pod/" + pod
+		}
+		if container, ok := o.parsedSelector.Container(); ok {
+			o.container = container
+		}
+	}
+
+	evalDefined, filenameDefined, programDefined := cmd.Flag("eval").Changed, cmd.Flag("filename").Changed, cmd.Flag("program").Changed
+	if !evalDefined && !filenameDefined && !programDefined {
 		return fmt.Errorf(bpftraceMissingErrString)
 	}
-	if cmd.Flag("eval").Changed == cmd.Flag("filename").Changed {
+	if (evalDefined && filenameDefined) || (evalDefined && programDefined) || (filenameDefined && programDefined) {
 		return fmt.Errorf(bpftraceDoubleErrString)
 	}
-	if (cmd.Flag("eval").Changed && len(o.eval) == 0) || (cmd.Flag("filename").Changed && len(o.program) == 0) {
+	if (evalDefined && len(o.eval) == 0) || (filenameDefined && len(o.program) == 0) || (programDefined && len(o.program) == 0) {
 		return fmt.Errorf(bpftraceEmptyErrString)
 	}
 
@@ -181,14 +240,16 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 // Complete completes the setup of the command.
 func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args []string) error {
 	// Prepare program
-	if len(o.program) > 0 {
-		b, err := ioutil.ReadFile(o.program)
-		if err != nil {
-			return fmt.Errorf("error opening program file")
+	if len(o.program) == 0 {
+		if len(o.filename) > 0 {
+			b, err := ioutil.ReadFile(o.filename)
+			if err != nil {
+				return fmt.Errorf("error opening program file")
+			}
+			o.program = string(b)
+		} else {
+			o.program = o.eval
 		}
-		o.program = string(b)
-	} else {
-		o.program = o.eval
 	}
 
 	// Prepare namespace
@@ -212,9 +273,6 @@ func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args 
 		return err
 	}
 
-	// Check we got a pod or a node
-	o.isPod = false
-
 	var node *v1.Node
 
 	switch v := obj.(type) {
@@ -222,13 +280,12 @@ func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args 
 		if len(v.Spec.NodeName) == 0 {
 			return fmt.Errorf("cannot attach a trace program to a pod that is not currently scheduled on a node")
 		}
-		o.isPod = true
 		found := false
-		o.podUID = string(v.UID)
+		o.parsedSelector.Set("pod-uid", string(v.UID))
 		for _, c := range v.Spec.Containers {
 			// default if no container provided
 			if len(o.container) == 0 {
-				o.container = c.Name
+				o.parsedSelector.Set("container", c.Name)
 				found = true
 				break
 			}
@@ -274,7 +331,7 @@ func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args 
 	if !ok {
 		return fmt.Errorf("label kubernetes.io/hostname not found in node")
 	}
-	o.nodeName = val
+	o.parsedSelector.Set("node", val)
 
 	// Prepare client
 	o.clientConfig, err = factory.ToRESTConfig()
@@ -303,16 +360,18 @@ func (o *RunOptions) Run() error {
 		ConfigClient: coreClient.ConfigMaps(o.namespace),
 	}
 
+	node, _ := o.parsedSelector.Node()
+
 	tj := tracejob.TraceJob{
 		Name:                fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
 		Namespace:           o.namespace,
 		ServiceAccount:      o.serviceAccount,
 		ID:                  juid,
-		Hostname:            o.nodeName,
+		Hostname:            node,
+		Tracer:              o.tracer,
+		Selector:            o.parsedSelector.String(),
+		Output:              "stdout",
 		Program:             o.program,
-		PodUID:              o.podUID,
-		ContainerName:       o.container,
-		IsPod:               o.isPod,
 		ImageNameTag:        o.imageName,
 		InitImageNameTag:    o.initImageName,
 		FetchHeaders:        o.fetchHeaders,

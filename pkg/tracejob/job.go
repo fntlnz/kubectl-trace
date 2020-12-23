@@ -30,10 +30,10 @@ type TraceJob struct {
 	Namespace           string
 	ServiceAccount      string
 	Hostname            string
+	Tracer              string
+	Selector            string
+	Output              string
 	Program             string
-	PodUID              string
-	ContainerName       string
-	IsPod               bool
 	ImageNameTag        string
 	InitImageNameTag    string
 	FetchHeaders        bool
@@ -187,20 +187,22 @@ func (t *TraceJobClient) DeleteJobs(nf TraceJobFilter) error {
 
 func (t *TraceJobClient) CreateJob(nj TraceJob) (*batchv1.Job, error) {
 
-	bpfTraceCmd := []string{
+	traceCmd := []string{
 		"/bin/timeout",
 		"--preserve-status",
 		"--signal",
 		"INT",
 		strconv.FormatInt(nj.Deadline, 10),
 		"/bin/trace-runner",
-		"--program=/programs/program.bt",
+		"--tracer=" + nj.Tracer,
+		"--selector=" + nj.Selector,
+		"--output=" + nj.Output,
 	}
 
-	if nj.IsPod {
-		bpfTraceCmd = append(bpfTraceCmd, "--inpod")
-		bpfTraceCmd = append(bpfTraceCmd, "--container="+nj.ContainerName)
-		bpfTraceCmd = append(bpfTraceCmd, "--poduid="+nj.PodUID)
+	if nj.Tracer == "bpftrace" {
+		traceCmd = append(traceCmd, "--program=/programs/program.bt")
+	} else {
+		traceCmd = append(traceCmd, "--program="+nj.Program)
 	}
 
 	commonMeta := metav1.ObjectMeta{
@@ -276,7 +278,7 @@ func (t *TraceJobClient) CreateJob(nj TraceJob) (*batchv1.Job, error) {
 						apiv1.Container{
 							Name:    nj.Name,
 							Image:   nj.ImageNameTag,
-							Command: bpfTraceCmd,
+							Command: traceCmd,
 							TTY:     true,
 							Stdin:   true,
 							Resources: apiv1.ResourceRequirements{

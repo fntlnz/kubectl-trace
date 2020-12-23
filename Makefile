@@ -12,7 +12,7 @@ GIT_BRANCH_CLEAN := $(shell echo $(GIT_BRANCH) | sed -e "s/[^[:alnum:]]/-/g")
 GIT_ORG ?= iovisor
 
 IMAGE_NAME_INIT ?= quay.io/$(GIT_ORG)/kubectl-trace-init
-IMAGE_NAME ?= quay.io/$(GIT_ORG)/kubectl-trace-bpftrace
+IMAGE_NAME ?= quay.io/$(GIT_ORG)/kubectl-trace-runner
 
 IMAGE_TRACERUNNER_BRANCH := $(IMAGE_NAME):$(GIT_BRANCH_CLEAN)
 IMAGE_TRACERUNNER_COMMIT := $(IMAGE_NAME):$(GIT_COMMIT)
