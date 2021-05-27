@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+
+def loop_forever
+  while true
+    puts "#{$0} still alive"
+    sleep(3600)
+  end
+end
+
+trap "SIGINT" do
+  puts "Exiting..."
+  exit
+end
+
+ARGV.each do |arg|
+  fork do
+    $0 = arg
+    loop_forever
+  end
+end
+
+loop_forever

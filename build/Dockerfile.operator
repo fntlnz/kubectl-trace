@@ -1,0 +1,25 @@
+# syntax = docker/dockerfile:1.2
+FROM golang:1.15-buster as gobuilder
+
+WORKDIR /go/src/github.com/iovisor/kubectl-trace
+
+# first copy the go mod files and sync the module cache as this step is expensive
+COPY go.* .
+RUN go mod download
+
+# TODO: keep trimming this down
+COPY Makefile .
+COPY pkg pkg
+COPY operator operator
+
+# reuse the build cache
+RUN --mount=type=cache,target=/root/.cache/go-build make operator
+
+# Use distroless as minimal base image to package the controller binary
+# Refer to https://github.com/GoogleContainerTools/distroless for more details
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=gobuilder /go/src/github.com/iovisor/kubectl-trace/operator/_output/bin/kubectl-trace-controller .
+USER nonroot:nonroot
+
+ENTRYPOINT ["/kubectl-trace-controller"]

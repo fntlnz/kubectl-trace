@@ -193,7 +193,7 @@ func jobsTablePrint(o io.Writer, jobs []tracejob.TraceJob) {
 		if status == "" {
 			status = tracejob.TraceJobUnknown
 		}
-		fmt.Fprintf(w, "\n"+format, j.Namespace, j.Hostname, j.Name, status, translateTimestampSince(j.StartTime))
+		fmt.Fprintf(w, "\n"+format, j.Namespace, j.Target.Node, j.Name, status, translateTimestampSince(j.StartTime))
 	}
 	fmt.Fprintf(w, "\n")
 }

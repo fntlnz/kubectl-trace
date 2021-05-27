@@ -1,6 +1,6 @@
 name: Kubectl trace build and tests
 
-on: [push, pull_request]
+on: [pull_request]
 
 jobs:
   build_and_test:
@@ -9,6 +9,9 @@ jobs:
       matrix:
         os: [ubuntu-16.04, ubuntu-18.04] # 16.04.4 release has 4.15 kernel
                                          # 18.04.3 release has 5.0.0 kernel
+        env:
+        - TEST_KUBERNETES_BACKEND: minikube
+        - TEST_KUBERNETES_BACKEND: kind
     steps:
     - uses: actions/checkout@v2
     - run: git fetch --prune --unshallow # We want tags
@@ -17,17 +20,8 @@ jobs:
       id: vars
       shell: bash
       run: |
-          if [ -n "${QUAY_TOKEN}" ];then
-            echo "Quay token is set, will push an image"
-            echo ::set-output name=QUAY_PUBLISH::true
-          else
-            echo "Quay token not set, skipping image push"
-          fi
-
-          git_org=$(dirname ${{ github.repository }})
+          git_org="iovisor"
           echo GIT_ORG=${git_org} >> $GITHUB_ENV
-      env:
-        QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
 
     - name: Run tests
       run: |
@@ -41,11 +35,24 @@ jobs:
       run: |
        ./build/scripts/ci-build-image.sh ${{ github.ref }}
 
+    - name: Install minikube
+      env: ${{matrix.env}}
+      if: ${{ env.TEST_KUBERNETES_BACKEND == 'minikube' }}
+      run: |
+        curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+        sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
     - name: Run integration tests
+      env: ${{matrix.env}}
       run: |
         make integration
 
+#    - name: Debug failure over SSH
+#      if: ${{ failure() }}
+#      uses: mxschmitt/action-tmate@v3
+
     - name: Build cross binaries
+      if: github.ref == 'refs/heads/master'
       run: |
         curl -LO https://github.com/goreleaser/goreleaser/releases/latest/download/goreleaser_amd64.deb && sudo dpkg -i goreleaser_amd64.deb
         make cross
@@ -54,16 +61,3 @@ jobs:
       with:
         name: ${{ matrix.os }}-kubectl-trace-dist
         path: _output/bin/kubectl-trace
-
-    - uses: actions/upload-artifact@v1
-      with:
-        name: ${{ matrix.os }}-kubectl-trace-cross-dist
-        path: dist
-
-    - name: Upload docker image
-      if: >
-        steps.vars.outputs.QUAY_PUBLISH
-      env:
-        QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
-      run: |
-        ./build/scripts/ci-release-image.sh ${{ github.ref }}

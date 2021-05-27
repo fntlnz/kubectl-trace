@@ -1,0 +1,4 @@
+{
+  "host": "this-file-was-included-in-tarball",
+  "args": ["--attach", "--fetch-headers"]
+}

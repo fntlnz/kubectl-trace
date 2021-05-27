@@ -1,0 +1,22 @@
+SHELL=/bin/bash -o pipefail
+
+IMAGE_NAME_RUBY ?= quay.io/$(GIT_ORG)/target-ruby
+
+IMAGE_RUBY_BRANCH := $(IMAGE_NAME_RUBY):$(GIT_BRANCH_CLEAN)
+IMAGE_RUBY_COMMIT := $(IMAGE_NAME_RUBY):$(GIT_COMMIT)
+IMAGE_RUBY_TAG    := $(IMAGE_NAME_RUBY):$(GIT_TAG)
+IMAGE_RUBY_LATEST := $(IMAGE_NAME_RUBY):latest
+
+.PHONY: image/ruby-target
+image/ruby-target:
+	DOCKER_BUILDKIT=1 $(DOCKER) build \
+		--build-arg GIT_ORG=$(GIT_ORG) \
+		--progress=$(DOCKER_BUILD_PROGRESS) \
+		-t "$(IMAGE_RUBY_BRANCH)" \
+		-f Dockerfile \
+		${IMAGE_BUILD_FLAGS_EXTRA} \
+		.
+	$(DOCKER) tag "$(IMAGE_RUBY_BRANCH)" $(IMAGE_RUBY_COMMIT)
+	$(DOCKER) tag "$(IMAGE_RUBY_BRANCH)" $(IMAGE_RUBY_BRANCH)
+	$(DOCKER) tag "$(IMAGE_RUBY_BRANCH)" $(IMAGE_RUBY_TAG)
+	$(DOCKER) tag "$(IMAGE_RUBY_BRANCH)" $(IMAGE_RUBY_LATEST)

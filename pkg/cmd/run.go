@@ -4,17 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"strings"
 
 	"github.com/iovisor/kubectl-trace/pkg/attacher"
+	"github.com/iovisor/kubectl-trace/pkg/downloader"
 	"github.com/iovisor/kubectl-trace/pkg/meta"
 	"github.com/iovisor/kubectl-trace/pkg/signals"
 	"github.com/iovisor/kubectl-trace/pkg/tracejob"
 	"github.com/spf13/cobra"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/client-go/kubernetes/scheme"
-	batchv1client "k8s.io/client-go/kubernetes/typed/batch/v1"
+	"k8s.io/client-go/kubernetes"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -22,7 +22,7 @@ import (
 
 var (
 	// ImageName represents the default tracerunner image
-	ImageName = "quay.io/iovisor/kubectl-trace-bpftrace"
+	ImageName = "quay.io/iovisor/kubectl-trace-runner"
 	// ImageTag represents the tag to fetch for ImageName
 	ImageTag = "latest"
 	// InitImageName represents the default init container image
@@ -58,15 +58,21 @@ var (
   # Run a bpftrace inline program on a pod container with a custom image for the bpftrace container that will run your program in the cluster
   %[1]s trace run pod/nginx nginx -e "tracepoint:syscalls:sys_enter_* { @[probe] = count(); } --imagename=quay.io/custom-bpftrace-image-name"`
 
-	runCommand                             = "run"
-	usageString                            = "(POD | TYPE/NAME)"
-	requiredArgErrString                   = fmt.Sprintf("%s is a required argument for the %s command", usageString, runCommand)
-	containerAsArgOrFlagErrString          = "specify container inline as argument or via its flag"
-	bpftraceMissingErrString               = "the bpftrace program is mandatory"
-	bpftraceDoubleErrString                = "specify the bpftrace program either via an external file or via a literal string, not both"
-	bpftraceEmptyErrString                 = "the bpftrace programm cannot be empty"
-	bpftracePatchWithoutTypeErrString      = "to use --patch you must also specify the --patch-type argument"
-	bpftracePatchTypeWithoutPatchErrString = "to use --patch-type you must specify the --patch argument"
+	runCommand                    = "run"
+	usageString                   = "(POD | TYPE/NAME)"
+	requiredArgErrString          = fmt.Sprintf("%s is a required argument for the %s command", usageString, runCommand)
+	containerAsArgOrFlagErrString = "specify container inline as argument or via its flag"
+	bpftraceMissingErrString      = "the bpftrace program is mandatory"
+	bpftraceDoubleErrString       = "specify the bpftrace program either via an external file or via a literal string, not both"
+	bpftraceEmptyErrString        = "the bpftrace programm cannot be empty"
+
+	tracerNotFound                   = "unknown tracer %s"
+	tracerNeededForSelectorErrString = "tracer must be specified when specifying selector"
+	tracerNeededForOutputErrString   = "tracer must be specified when specifying output"
+	containerAsSelectorErrString     = "container must be specified in selector when specifying tracer"
+	resourceAsSelectorErrString      = "node/pod must be specified in selector when specifying tracer"
+
+	pidProcessSelectorRequiredForTracer = "a pid process selector must be specified for tracer %s"
 )
 
 // RunOptions ...
@@ -77,9 +83,22 @@ type RunOptions struct {
 	explicitNamespace bool
 
 	// Flags local to this command
-	container           string
-	eval                string
-	program             string
+	eval     string
+	filename string
+
+	// Flags for generic interface
+	// See TraceRunnerOptions for definitions.
+	// TODO: clean this up
+	tracer          string
+	targetNamespace string
+	processSelector string
+	program         string
+	programArgs     []string
+	output          string
+	tracerDefined   bool
+	parsedSelector  *tracejob.ProcessSelector
+
+	googleAppSecret     string
 	serviceAccount      string
 	imageName           string
 	initImageName       string
@@ -88,13 +107,10 @@ type RunOptions struct {
 	deadlineGracePeriod int64
 
 	resourceArg string
-	attach      bool
-	isPod       bool
-	podUID      string
-	nodeName    string
+	container   string
 
-	patch     string
-	patchType string
+	attach   bool
+	download bool
 
 	clientConfig *rest.Config
 }
@@ -137,25 +153,67 @@ func NewRunCommand(factory cmdutil.Factory, streams genericclioptions.IOStreams)
 		},
 	}
 
+	// flags for existing usage
 	cmd.Flags().StringVarP(&o.container, "container", "c", o.container, "Specify the container")
-	cmd.Flags().BoolVarP(&o.attach, "attach", "a", o.attach, "Whether or not to attach to the trace program once it is created")
 	cmd.Flags().StringVarP(&o.eval, "eval", "e", o.eval, "Literal string to be evaluated as a bpftrace program")
-	cmd.Flags().StringVarP(&o.program, "filename", "f", o.program, "File containing a bpftrace program")
+	cmd.Flags().StringVarP(&o.filename, "filename", "f", o.filename, "File containing a bpftrace program")
+
+	// flags for new generic interface
+	cmd.Flags().StringVar(&o.tracer, "tracer", "bpftrace", "Tracing system to use")
+	cmd.Flags().StringVar(&o.targetNamespace, "target-namespace", "", "Namespace in which the target pod exists (if applicable). Defaults to the namespace argument passed to kubectl.")
+	cmd.Flags().StringVar(&o.processSelector, "process-selector", "", "Process Selector (similar to a label query) to filter on")
+	cmd.Flags().StringVar(&o.output, "output", "stdout", "Where to send tracing output (stdout or local path)")
+	cmd.Flags().StringVar(&o.program, "program", o.program, "Program to execute")
+	cmd.Flags().StringArrayVar(&o.programArgs, "args", o.programArgs, "Additional arguments to pass on to program, repeat flag for multiple arguments")
+
+	// global flags
+	cmd.Flags().StringVar(&o.googleAppSecret, "google-application-secret", o.googleAppSecret, "A secret containing a JSON formatted google service account key, for GOOGLE_APPLICATION_CREDENITALS. Used for GCS support.")
+	cmd.Flags().BoolVarP(&o.attach, "attach", "a", o.attach, "Whether or not to attach to the trace program once it is created")
 	cmd.Flags().StringVar(&o.serviceAccount, "serviceaccount", o.serviceAccount, "Service account to use to set in the pod spec of the kubectl-trace job")
 	cmd.Flags().StringVar(&o.imageName, "imagename", o.imageName, "Custom image for the tracerunner")
 	cmd.Flags().StringVar(&o.initImageName, "init-imagename", o.initImageName, "Custom image for the init container responsible to fetch and prepare linux headers")
 	cmd.Flags().BoolVar(&o.fetchHeaders, "fetch-headers", o.fetchHeaders, "Whether to fetch linux headers or not")
 	cmd.Flags().Int64Var(&o.deadline, "deadline", o.deadline, "Maximum time to allow trace to run in seconds")
 	cmd.Flags().Int64Var(&o.deadlineGracePeriod, "deadline-grace-period", o.deadlineGracePeriod, "Maximum wait time to print maps or histograms after deadline, in seconds")
-	cmd.Flags().StringVar(&o.patch, "patch", "", "path of YAML or JSON file used to patch the job definition before creation")
-	cmd.Flags().StringVar(&o.patchType, "patch-type", "", "patch strategy to use: json, merge, or strategic")
 
 	return cmd
 }
 
 // Validate validates the arguments and flags populating RunOptions accordingly.
 func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
+	// Selector can only be used in conjunction with tracer.
+	o.tracerDefined = cmd.Flag("tracer").Changed
+	if !o.tracerDefined && cmd.Flag("process-selector").Changed {
+		return fmt.Errorf(tracerNeededForSelectorErrString)
+	}
+	if !o.tracerDefined && cmd.Flag("output").Changed {
+		return fmt.Errorf(tracerNeededForOutputErrString)
+	}
+
+	switch o.tracer {
+	case bpftrace, bcc, rbspy, fake:
+	default:
+		return fmt.Errorf(tracerNotFound, o.tracer)
+	}
+
+	parsed, err := tracejob.NewProcessSelector(o.processSelector)
+	if err != nil {
+		return fmt.Errorf(err.Error())
+	}
+	o.parsedSelector = parsed
+
+	err = validateSelectorForTracer(o.tracer, o.parsedSelector)
+	if err != nil {
+		return err
+	}
+
+	// All filtering must be via selector if tracer is specified.
 	containerFlagDefined := cmd.Flag("container").Changed
+	if o.tracerDefined && containerFlagDefined {
+		return fmt.Errorf(containerAsSelectorErrString)
+	}
+
+	//if !o.tracerDefined {
 	switch len(args) {
 	case 1:
 		o.resourceArg = args[0]
@@ -163,7 +221,7 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 	// 2nd argument interpreted as container when provided
 	case 2:
 		o.resourceArg = args[0]
-		o.container = args[1]
+		o.container = args[1] // NOTE: this should actually be -c, to be consistent with the rest of kubectl
 		if containerFlagDefined {
 			return fmt.Errorf(containerAsArgOrFlagErrString)
 		}
@@ -172,25 +230,32 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf(requiredArgErrString)
 	}
 
-	if !cmd.Flag("eval").Changed && !cmd.Flag("filename").Changed {
-		return fmt.Errorf(bpftraceMissingErrString)
-	}
-	if cmd.Flag("eval").Changed == cmd.Flag("filename").Changed {
-		return fmt.Errorf(bpftraceDoubleErrString)
-	}
-	if (cmd.Flag("eval").Changed && len(o.eval) == 0) || (cmd.Flag("filename").Changed && len(o.program) == 0) {
-		return fmt.Errorf(bpftraceEmptyErrString)
+	if len(o.output) == 0 {
+		return fmt.Errorf("output cannot be empty when specified")
 	}
 
-	havePatch := cmd.Flag("patch").Changed
-	havePatchType := cmd.Flag("patch-type").Changed
-
-	if havePatch && !havePatchType {
-		return fmt.Errorf(bpftracePatchWithoutTypeErrString)
+	switch {
+	case o.output == "stdout":
+	case o.output[0] == '/' || o.output[0] == '.':
+		o.download = true
+	case strings.HasPrefix(o.output, "gs://"):
+	default:
+		return fmt.Errorf("unknown output %s", o.output)
 	}
 
-	if !havePatch && havePatchType {
-		return fmt.Errorf(bpftracePatchTypeWithoutPatchErrString)
+	switch o.tracer {
+	case bpftrace, bcc:
+		evalDefined, filenameDefined, programDefined := cmd.Flag("eval").Changed, cmd.Flag("filename").Changed, cmd.Flag("program").Changed
+		if !evalDefined && !filenameDefined && !programDefined {
+			return fmt.Errorf(bpftraceMissingErrString)
+		}
+		if (evalDefined && filenameDefined) || (evalDefined && programDefined) || (filenameDefined && programDefined) {
+			return fmt.Errorf(bpftraceDoubleErrString)
+		}
+		if (evalDefined && len(o.eval) == 0) || (filenameDefined && len(o.program) == 0) || (programDefined && len(o.program) == 0) {
+			return fmt.Errorf(bpftraceEmptyErrString)
+		}
+	default:
 	}
 
 	return nil
@@ -199,100 +264,30 @@ func (o *RunOptions) Validate(cmd *cobra.Command, args []string) error {
 // Complete completes the setup of the command.
 func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args []string) error {
 	// Prepare program
-	if len(o.program) > 0 {
-		b, err := ioutil.ReadFile(o.program)
-		if err != nil {
-			return fmt.Errorf("error opening program file")
+	if len(o.program) == 0 {
+		if len(o.filename) > 0 {
+			b, err := ioutil.ReadFile(o.filename)
+			if err != nil {
+				return fmt.Errorf("error opening program file")
+			}
+			o.program = string(b)
+		} else {
+			o.program = o.eval
 		}
-		o.program = string(b)
-	} else {
-		o.program = o.eval
 	}
 
-	// Prepare namespace
+	// Prepare namespaces
 	var err error
 	o.namespace, o.explicitNamespace, err = factory.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
 	}
 
-	// Look for the target object
-	x := factory.
-		NewBuilder().
-		WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
-		NamespaceParam(o.namespace).
-		SingleResourceType().
-		ResourceNames("nodes", o.resourceArg). // Search nodes by default
-		Do()
-
-	obj, err := x.Object()
-	if err != nil {
-		return err
+	// If a target namespace is not specified explicitly, we want to reuse the
+	// namespace as understood by kubectl.
+	if o.targetNamespace == "" {
+		o.targetNamespace = o.namespace
 	}
-
-	// Check we got a pod or a node
-	o.isPod = false
-
-	var node *v1.Node
-
-	switch v := obj.(type) {
-	case *v1.Pod:
-		if len(v.Spec.NodeName) == 0 {
-			return fmt.Errorf("cannot attach a trace program to a pod that is not currently scheduled on a node")
-		}
-		o.isPod = true
-		found := false
-		o.podUID = string(v.UID)
-		for _, c := range v.Spec.Containers {
-			// default if no container provided
-			if len(o.container) == 0 {
-				o.container = c.Name
-				found = true
-				break
-			}
-			// check if the provided one exists
-			if c.Name == o.container {
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return fmt.Errorf("no containers found for the provided pod/container combination")
-		}
-
-		obj, err = factory.
-			NewBuilder().
-			WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
-			ResourceNames("nodes", v.Spec.NodeName).
-			Do().Object()
-
-		if err != nil {
-			return err
-		}
-
-		if n, ok := obj.(*v1.Node); ok {
-			node = n
-		}
-
-		break
-	case *v1.Node:
-		node = v
-		break
-	default:
-		return fmt.Errorf("first argument must be %s", usageString)
-	}
-
-	if node == nil {
-		return fmt.Errorf("could not determine on which node to run the trace program")
-	}
-
-	labels := node.GetLabels()
-	val, ok := labels["kubernetes.io/hostname"]
-	if !ok {
-		return fmt.Errorf("label kubernetes.io/hostname not found in node")
-	}
-	o.nodeName = val
 
 	// Prepare client
 	o.clientConfig, err = factory.ToRESTConfig()
@@ -306,38 +301,38 @@ func (o *RunOptions) Complete(factory cmdutil.Factory, cmd *cobra.Command, args 
 // Run executes the run command.
 func (o *RunOptions) Run() error {
 	juid := uuid.NewUUID()
-	jobsClient, err := batchv1client.NewForConfig(o.clientConfig)
+
+	clientset, err := kubernetes.NewForConfig(o.clientConfig)
 	if err != nil {
 		return err
 	}
 
-	coreClient, err := corev1client.NewForConfig(o.clientConfig)
+	target, err := tracejob.ResolveTraceJobTarget(clientset, o.resourceArg, o.container, o.targetNamespace)
+
 	if err != nil {
 		return err
 	}
 
-	tc := &tracejob.TraceJobClient{
-		JobClient:    jobsClient.Jobs(o.namespace),
-		ConfigClient: coreClient.ConfigMaps(o.namespace),
-	}
+	tc := tracejob.NewTraceJobClient(clientset, o.namespace)
 
 	tj := tracejob.TraceJob{
-		Name:                fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
-		Namespace:           o.namespace,
-		ServiceAccount:      o.serviceAccount,
-		ID:                  juid,
-		Hostname:            o.nodeName,
+		Name:           fmt.Sprintf("%s%s", meta.ObjectNamePrefix, string(juid)),
+		Namespace:      o.namespace,
+		ServiceAccount: o.serviceAccount,
+		ID:             juid,
+		Target:         *target,
+		// FIXME find a way to pass remaining members of trace job target
+		Tracer:              o.tracer,
+		Selector:            o.processSelector,
+		Output:              o.output,
 		Program:             o.program,
-		PodUID:              o.podUID,
-		ContainerName:       o.container,
-		IsPod:               o.isPod,
+		ProgramArgs:         o.programArgs,
+		GoogleAppSecret:     o.googleAppSecret,
 		ImageNameTag:        o.imageName,
 		InitImageNameTag:    o.initImageName,
 		FetchHeaders:        o.fetchHeaders,
 		Deadline:            o.deadline,
 		DeadlineGracePeriod: o.deadlineGracePeriod,
-		Patch:               o.patch,
-		PatchType:           o.patchType,
 	}
 
 	job, err := tc.CreateJob(tj)
@@ -347,12 +342,44 @@ func (o *RunOptions) Run() error {
 
 	fmt.Fprintf(o.IOStreams.Out, "trace %s created\n", tj.ID)
 
+	if o.download {
+		if o.attach {
+			go o.waitOnDownload(tj, clientset.CoreV1())
+		} else {
+			fmt.Fprintln(o.IOStreams.Out, "waiting for trace to be downloaded")
+			o.waitOnDownload(tj, clientset.CoreV1())
+		}
+	}
+
 	if o.attach {
 		ctx := context.Background()
 		ctx = signals.WithStandardSignals(ctx)
-		a := attacher.NewAttacher(coreClient, o.clientConfig, o.IOStreams)
+		a := attacher.NewAttacher(clientset.CoreV1(), o.clientConfig, o.IOStreams)
 		a.WithContext(ctx)
 		a.AttachJob(tj.ID, job.Namespace)
+	}
+
+	return nil
+}
+
+func (o *RunOptions) waitOnDownload(tj tracejob.TraceJob, coreClient corev1client.CoreV1Interface) {
+	d := downloader.New(coreClient, o.clientConfig)
+	err := d.Start(tj.ID, tj.Namespace, o.output, MetadataDir)
+	if err != nil {
+		fmt.Fprintf(o.IOStreams.ErrOut, "[downloader] %s\n", err.Error())
+		return
+	}
+	fmt.Fprintf(o.IOStreams.Out, "downloaded %v\n", downloader.Filename(tj.ID))
+}
+
+func validateSelectorForTracer(tracer string, selector *tracejob.ProcessSelector) error {
+	switch tracer {
+	case bcc, bpftrace, fake:
+	case rbspy:
+		if _, ok := selector.Pid(); !ok {
+			return fmt.Errorf(pidProcessSelectorRequiredForTracer, rbspy)
+		}
+	default:
 	}
 
 	return nil

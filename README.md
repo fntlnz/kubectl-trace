@@ -21,7 +21,6 @@ of [bpftrace](https://github.com/iovisor/bpftrace) programs in your Kubernetes c
   * [Running against a Pod vs against a Node](#running-against-a-pod-vs-against-a-node)
   * [Using a custom service account](#using-a-custom-service-account)
   * [Executing in a cluster using Pod Security Policies](#executing-in-a-cluster-using-pod-security-policies)
-  * [Using a patch to customize the trace job](#using-a-patch-to-customize-the-trace-job)
   * [More bpftrace programs](#more-bpftrace-programs)
 - [Status of the project](#status-of-the-project)
 - [Contributing](#contributing)
@@ -267,72 +266,6 @@ If you used a different namespace other than default for your service account, y
 
 ```bash
 kubectl trace run --namespace=mynamespace --serviceaccount=kubectltrace ip-180-12-0-152.ec2.internal -f read.bt
-```
-
-### Using a patch to customize the trace job
-
-There may be times when you need to customize the job descriptor that kubectl-trace generates. You can provide a patch file that will modify any of the job's attributes before it executes on the cluster.
-
-The `--patch` and `--patch-type` arguments to the `run` command specify your patch file's location and merge strategy:
-
- * `--patch` - sets the path to a YAML or JSON file containing your patch.
- * `--patch-type` - sets the strategy that will be used to modify the job descriptor.
-
-**Patch strategies**
-
-The supported patch strategies are the same as those used by Kubernetes to support [in-place API object updates](https://v1-17.docs.kubernetes.io/docs/tasks/run-application/update-api-object-kubectl-patch/#use-a-json-merge-patch-to-update-a-deployment).
-
-These 3 patch strategies are:
-
- - `json` - Sets the [JSON patch](http://jsonpatch.com/) strategy (see [RFC 6209](https://tools.ietf.org/html/rfc6902)).
- - `merge` - Sets the [JSON merge patch](https://tools.ietf.org/html/rfc7396) strategy.
- - `strategic` - [JSON strategic merge patch]() is like the "JSON merge patch" but with different array handling (see [Kubernetes strategic merge](https://v1-17.docs.kubernetes.io/docs/tasks/run-application/update-api-object-kubectl-patch/#use-a-json-merge-patch-to-update-a-deployment) for more).
-
-**Note:** You can create your patch files in either YAML or JSON format. The format is independent of the strategy used, e.g. the strategy `json` refers to the "JSON patch" strategy, not the format of the patch file.
-
-**Example: customizing resource limits**
-
-A cluster administrator may have set strict resource limits that conflict with the defaults used by `kubectl-trace`, preventing your job from executing. With a patch you can adjust a job's resource limits to match your cluster's config.
-
-Below is an example of a YAML patch which uses the `json` strategy ("JSON patch"). This strategy consists of a list of operations (add, replace, remove), a path which references a location in the document, and an optional value (to add or replace).
-
-The patch below replaces the first container's resources section, in order to increase both the request and limit values for cpu and memory:
-
-```yaml
-# mypatch.yaml
-- op: replace
-  path: /spec/template/spec/containers/0/resources
-  value:
-    limits:
-      cpu: 2
-      memory: 500Mi
-    requests:
-      cpu: 2
-      memory: 500Mi
-```
-
-We can now run the job using our patch:
-
-```bash
-kubectl trace run ip-180-12-0-152.ec2.internal -f read.bt --patch mypatch.yaml --patch-type json
-```
-
-**Example: setting an environment variable**
-
-The following JSON format patch adds a `BPFTRACE_STRLEN` environment variable to the first container. The variable increases `bpftrace`'s string length limit from 64 to 128:
-
-```json
-[
-  {
-    "op": "add",
-    "path": "/spec/template/spec/containers/0/env",
-    "value": [{ "name": "BPFTRACE_STRLEN", "value": "128" }]
-  }
-]
-```
-
-```bash
-kubectl trace run ip-180-12-0-152.ec2.internal -f read.bt --patch mypatch.json --patch-type json
 ```
 
 ### More bpftrace programs
