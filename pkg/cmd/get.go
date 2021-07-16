@@ -174,7 +174,7 @@ func (o *GetOptions) Run() error {
 // TODO(fntlnz): This needs better printing, perhaps we could use the humanreadable table from k8s itself
 // to be consistent with the main project.
 func jobsTablePrint(o io.Writer, jobs []tracejob.TraceJob) {
-	format := "%s\t%s\t%s\t%s\t%s\t"
+	format := "%s \t %s \t %s \t %s \t %s\t"
 	if len(jobs) == 0 {
 		fmt.Println("No resources found.")
 		return
